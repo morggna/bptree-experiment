@@ -1,0 +1,20 @@
+# 编译产物
+*.o
+*.exe
+*.out
+
+# CMake 构建目录
+cmake-build-*/
+build/
+
+# B+树生成的索引文件
+*.idx
+
+# 程序运行输出（可通过重新运行生成）
+*.csv
+*.png
+
+# Python 虚拟环境
+.venv/
+__pycache__/
+*.pyc
