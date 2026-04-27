@@ -132,10 +132,8 @@ int BPTree::range_query(int64_t key_min, int64_t key_max,
         pgno = chld[i];
     }
 
-    // 顺序扫描叶链
-    while (pgno != NULL_PG) {
-        read_page(pgno, pg);
-        io_count++;
+    // 顺序扫描叶链（第一个叶节点已由上方循环读入 pg，直接使用，避免重复 IO）
+    while (true) {
         int n = pg.count();
         const Record* recs = pg.records();
         bool past = false;
@@ -145,6 +143,9 @@ int BPTree::range_query(int64_t key_min, int64_t key_max,
         }
         if (past) break;
         pgno = pg.next();
+        if (pgno == NULL_PG) break;
+        read_page(pgno, pg);
+        io_count++;
     }
     return (int)results.size();
 }
