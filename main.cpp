@@ -5,6 +5,7 @@
 #endif
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -50,6 +51,36 @@ static void collect_plt_files(const std::string& dir,
 static bool directory_exists(const std::string& path) {
     struct stat st;
     return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static std::string find_local_geolife_dir() {
+    DIR* dp = opendir(".");
+    if (!dp) {
+        return "";
+    }
+
+    struct dirent* ep;
+    while ((ep = readdir(dp))) {
+        if (strncmp(ep->d_name, "GEOLIFE", 7) != 0) {
+            continue;
+        }
+
+        std::string full = std::string(".") + "/" + ep->d_name;
+        struct stat st;
+        if (stat(full.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+            continue;
+        }
+
+        std::vector<std::string> files;
+        collect_plt_files(full, files);
+        if (!files.empty()) {
+            closedir(dp);
+            return full;
+        }
+    }
+
+    closedir(dp);
+    return "";
 }
 
 // 去掉 fgets 读入行末尾的换行符，方便后面解析时间字符串。
@@ -112,32 +143,20 @@ static int parse_plt_and_insert(const std::string& path, BPTree& tree,
     double lat = 0.0;
     double lon = 0.0;
     double dummy = 0.0;
+    double alt_value = 0.0;
+    double days_value = 0.0;
     int alt = 0;
     char date_str[32];
     char time_str[32];
 
     while (fgets(line, sizeof(line), fp)) {
-        // 每行中纬度、经度、海拔、日期、时间会被转换成一条 Record。
-        if (sscanf(line, "%lf,%lf,%lf,%d", &lat, &lon, &dummy, &alt) != 4) {
+        // GEOLIFE 每行格式为：纬度、经度、0、海拔、日期数值、日期、时间。
+        if (sscanf(line, "%lf,%lf,%lf,%lf,%lf,%31[^,],%31s",
+                   &lat, &lon, &dummy, &alt_value, &days_value,
+                   date_str, time_str) != 7) {
             continue;
         }
-
-        char* p = line;
-        int comma = 0;
-        while (*p && comma < 5) {
-            if (*p == ',') {
-                comma++;
-            }
-            p++;
-        }
-        if (comma < 5) {
-            continue;
-        }
-
-        if (sscanf(p, "%31[^,],%31s", date_str, time_str) != 2) {
-            continue;
-        }
-
+        alt = (int)std::lround(alt_value);
         strip_line_end(time_str);
 
         Timestamp timestamp = 0;
@@ -191,11 +210,17 @@ int main(int argc, char* argv[]) {
     printf("[1] \u6536\u96c6 .plt \u6587\u4ef6...\n");
     std::vector<std::string> plt_files;
     collect_plt_files(data_dir, plt_files);
+    if (plt_files.empty() && argc < 2) {
+        std::string local_dir = find_local_geolife_dir();
+        if (!local_dir.empty()) {
+            data_dir = local_dir;
+            collect_plt_files(data_dir, plt_files);
+        }
+    }
     // 排序后每次实验的导入顺序一致，结果更容易复现。
     std::sort(plt_files.begin(), plt_files.end());
     printf("    数据目录: %s\n", data_dir.c_str());
     printf("    \u5171\u627e\u5230 %zu \u4e2a .plt \u6587\u4ef6\n", plt_files.size());
-
     if (plt_files.empty()) {
         fprintf(stderr,
                 "没有找到 .plt 文件。请检查数据目录，或在 CLion Run Configuration 的 Program arguments 中传入数据集路径。\n"
