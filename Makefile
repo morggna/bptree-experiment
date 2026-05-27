@@ -5,10 +5,8 @@ SRCS     = bptree.cpp main.cpp
 OBJS     = $(SRCS:.cpp=.o)
 PYTHON   ?= python3
 
-# 数据集目录（可在命令行覆盖：make run DATA="路径"）
 DATA ?=
 
-# MSYS2 中 TEMP 需要指向可写目录
 export TEMP := /tmp
 export TMP  := /tmp
 
