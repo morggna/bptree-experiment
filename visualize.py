@@ -179,7 +179,8 @@ def main():
 
     plt.savefig('bptree_performance.png', dpi=150, bbox_inches='tight')
     print("图表已保存: bptree_performance.png")
-    if os.environ.get('BPTREE_SHOW_PLOT') == '1' and 'agg' not in matplotlib.get_backend().lower():
+    show_plot = os.environ.get('BPTREE_SHOW_PLOT', '1').lower() not in ('0', 'false', 'no')
+    if show_plot and 'agg' not in matplotlib.get_backend().lower():
         plt.show()
 
 
