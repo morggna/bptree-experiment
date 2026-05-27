@@ -44,14 +44,38 @@ static void collect_plt_files(const std::string& dir, std::vector<std::string>& 
     closedir(dp);
 }
 
+static std::string find_local_geolife_dir() {
+    DIR* dp = opendir(".");
+    if (!dp) return "";
+
+    struct dirent* ep;
+    while ((ep = readdir(dp))) {
+        if (strncmp(ep->d_name, "GEOLIFE", 7) != 0) continue;
+
+        std::string full = std::string(".") + "/" + ep->d_name;
+        struct stat st;
+        if (stat(full.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+
+        std::vector<std::string> files;
+        collect_plt_files(full, files);
+        if (!files.empty()) {
+            closedir(dp);
+            return full;
+        }
+    }
+
+    closedir(dp);
+    return "";
+}
+
 // ============================================================
 //  工具：将日期/时间字符串转 Unix 时间戳（UTC，秒）
 //  date_str: "YYYY-MM-DD"   time_str: "HH:MM:SS"
 // ============================================================
 static int64_t datetime_to_unix(const char* date_str, const char* time_str) {
     int year, month, day, hour, min, sec;
-    sscanf(date_str, "%d-%d-%d", &year, &month, &day);
-    sscanf(time_str, "%d:%d:%d", &hour, &min, &sec);
+    if (sscanf(date_str, "%d-%d-%d", &year, &month, &day) != 3) return -1;
+    if (sscanf(time_str, "%d:%d:%d", &hour, &min, &sec) != 3) return -1;
     // Zeller 公式变体计算距 1970-01-01 的天数
     if (month <= 2) { month += 12; year--; }
     int64_t jdn = (int64_t)365 * year + year / 4 - year / 100 + year / 400
@@ -76,21 +100,17 @@ static int parse_plt_and_insert(const std::string& path, BPTree& tree,
     }
 
     int cnt = 0;
-    double lat, lon, dummy;
+    double lat, lon, dummy, alt_value, days_value;
     int    alt;
     char   date_str[32], time_str[32];
-    char   days_str[32];
 
     while (fgets(line, sizeof(line), fp)) {
         // 格式: lat,lon,0,altitude,days_since_1900,YYYY-MM-DD,HH:MM:SS
-        if (sscanf(line, "%lf,%lf,%lf,%d,%s", &lat, &lon, &dummy, &alt, days_str) < 4)
+        if (sscanf(line, "%lf,%lf,%lf,%lf,%lf,%31[^,],%31s",
+                   &lat, &lon, &dummy, &alt_value, &days_value,
+                   date_str, time_str) != 7)
             continue;
-        // 提取日期和时间（最后两个逗号分隔字段）
-        char* p = line;
-        int comma = 0;
-        while (*p && comma < 5) { if (*p == ',') comma++; p++; }
-        if (comma < 5) continue;
-        sscanf(p, "%31[^,],%31s", date_str, time_str);
+        alt = (int)std::lround(alt_value);
         // 去掉 time_str 末尾换行
         for (char* q = time_str; *q; q++) if (*q == '\r' || *q == '\n') { *q = 0; break; }
 
@@ -146,8 +166,20 @@ int main(int argc, char* argv[]) {
     printf("[1] \u6536\u96c6 .plt \u6587\u4ef6...\n");
     std::vector<std::string> plt_files;
     collect_plt_files(data_dir, plt_files);
+    if (plt_files.empty() && argc < 2) {
+        std::string local_dir = find_local_geolife_dir();
+        if (!local_dir.empty()) {
+            data_dir = local_dir;
+            collect_plt_files(data_dir, plt_files);
+        }
+    }
     std::sort(plt_files.begin(), plt_files.end());
+    printf("    \u6570\u636e\u76ee\u5f55: %s\n", data_dir.c_str());
     printf("    \u5171\u627e\u5230 %zu \u4e2a .plt \u6587\u4ef6\n", plt_files.size());
+    if (plt_files.empty()) {
+        fprintf(stderr, "\u672a\u627e\u5230 .plt \u6587\u4ef6\uff0c\u8bf7\u901a\u8fc7\u547d\u4ee4\u884c\u4f20\u5165 GEOLIFE \u6570\u636e\u76ee\u5f55\u3002\n");
+        return 1;
+    }
 
     BPTree tree;
     if (!tree.open(idx_file, true)) {
