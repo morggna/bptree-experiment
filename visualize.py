@@ -7,15 +7,55 @@ visualize.py  ——  B+树范围查询性能可视化
 """
 
 import csv
+import os
+import tempfile
+
+# Matplotlib 默认会尝试写 ~/.matplotlib；在某些 CLion/沙盒环境里不可写。
+os.environ.setdefault('MPLCONFIGDIR', os.path.join(tempfile.gettempdir(), 'bptree_matplotlib'))
+os.environ.setdefault('XDG_CACHE_HOME', os.path.join(tempfile.gettempdir(), 'bptree_cache'))
+
 import numpy as np
 import matplotlib
+import matplotlib.font_manager as font_manager
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 
-# 解决中文乱码
-matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
-matplotlib.rcParams['axes.unicode_minus'] = False
+def setup_chinese_font():
+    font_names = [
+        'STHeiti',
+        'Hiragino Sans GB',
+        'Songti SC',
+        'Arial Unicode MS',
+        'Microsoft YaHei',
+        'SimHei',
+        'DejaVu Sans',
+    ]
+    font_paths = [
+        '/System/Library/Fonts/STHeiti Medium.ttc',
+        '/System/Library/Fonts/STHeiti Light.ttc',
+        '/System/Library/Fonts/Hiragino Sans GB.ttc',
+        '/System/Library/Fonts/Supplemental/Songti.ttc',
+        '/System/Library/Fonts/Supplemental/Arial Unicode.ttf',
+    ]
+
+    for path in font_paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            font_manager.fontManager.addfont(path)
+            font_name = font_manager.FontProperties(fname=path).get_name()
+            matplotlib.rcParams['font.sans-serif'] = [font_name] + font_names
+            break
+        except RuntimeError:
+            continue
+    else:
+        matplotlib.rcParams['font.sans-serif'] = font_names
+
+    matplotlib.rcParams['axes.unicode_minus'] = False
+
+
+setup_chinese_font()
 
 # ============================================================
 #  读取数据
@@ -139,7 +179,8 @@ def main():
 
     plt.savefig('bptree_performance.png', dpi=150, bbox_inches='tight')
     print("图表已保存: bptree_performance.png")
-    plt.show()
+    if os.environ.get('BPTREE_SHOW_PLOT') == '1' and 'agg' not in matplotlib.get_backend().lower():
+        plt.show()
 
 
 if __name__ == '__main__':

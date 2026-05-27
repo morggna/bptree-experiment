@@ -103,21 +103,42 @@ int64_t BPTree::find_leaf(int64_t key, int& io_cnt) {
 
 bool BPTree::search(int64_t key, Record& out, int* io_count) {
     int io = 0;
-    int64_t leaf_pgno = find_leaf(key, io);
-    if (leaf_pgno == NULL_PG) { if (io_count) *io_count = io; return false; }
+    int64_t pgno = meta_.root_pg();
+    if (pgno == NULL_PG) { if (io_count) *io_count = io; return false; }
 
     PageBuf leaf;
-    read_page(leaf_pgno, leaf);
-    io++;
+    while (true) {
+        read_page(pgno, leaf);
+        io++;
+        if (leaf.type() == PAGE_LEAF) break;
 
-    int n = leaf.count();
-    const Record* recs = leaf.records();
-    for (int i = 0; i < n; i++) {
-        if (recs[i].key == key) {
-            out = recs[i];
-            if (io_count) *io_count = io;
-            return true;
+        int n = leaf.count();
+        const int64_t* keys = leaf.i_keys();
+        const int64_t* chld = leaf.i_children();
+        int i = 0;
+        while (i < n && key > keys[i]) i++;
+        pgno = chld[i];
+    }
+
+    int64_t leaf_pgno = pgno;
+    while (leaf_pgno != NULL_PG) {
+        read_page(leaf_pgno, leaf);
+        io++;
+
+        int n = leaf.count();
+        const Record* recs = leaf.records();
+        for (int i = 0; i < n; i++) {
+            if (recs[i].key == key) {
+                out = recs[i];
+                if (io_count) *io_count = io;
+                return true;
+            }
+            if (recs[i].key > key) {
+                if (io_count) *io_count = io;
+                return false;
+            }
         }
+        leaf_pgno = leaf.next();
     }
     if (io_count) *io_count = io;
     return false;
@@ -141,7 +162,7 @@ int BPTree::range_query(int64_t key_min, int64_t key_max,
         const int64_t* keys = pg.i_keys();
         const int64_t* chld = pg.i_children();
         int i = 0;
-        while (i < n && key_min >= keys[i]) i++;
+        while (i < n && key_min > keys[i]) i++;
         pgno = chld[i];
     }
 
@@ -392,14 +413,11 @@ void BPTree::delete_entry(int64_t pgno, int64_t key, int64_t ptr_to_remove) {
         int64_t* chld = pg.i_children();
         int cidx = -1;
         for (int i = 0; i <= n; i++) { if (chld[i] == ptr_to_remove) { cidx = i; break; } }
-        int kidx = -1;
-        for (int i = 0; i < n; i++) { if (keys[i] == key) { kidx = i; break; } }
-        if (kidx >= 0) {
-            for (int i = kidx; i < n - 1; i++) keys[i] = keys[i + 1];
-        }
-        if (cidx >= 0) {
-            for (int i = cidx; i <= n - 1; i++) chld[i] = chld[i + 1];
-        }
+        if (cidx <= 0) return;
+        int kidx = cidx - 1;
+        (void)key;
+        for (int i = kidx; i < n - 1; i++) keys[i] = keys[i + 1];
+        for (int i = cidx; i <= n - 1; i++) chld[i] = chld[i + 1];
         pg.count()--;
         write_page(pgno, pg);
     }
@@ -576,16 +594,35 @@ void BPTree::delete_entry(int64_t pgno, int64_t key, int64_t ptr_to_remove) {
 }
 
 bool BPTree::remove(int64_t key) {
-    int io_dummy;
-    int64_t leaf_pgno = find_leaf(key, io_dummy);
-    if (leaf_pgno == NULL_PG) return false;
-
     PageBuf leaf;
-    read_page(leaf_pgno, leaf);
-    int n = leaf.count();
-    const Record* recs = leaf.records();
+    int64_t pgno = meta_.root_pg();
+    if (pgno == NULL_PG) return false;
+
+    while (true) {
+        read_page(pgno, leaf);
+        if (leaf.type() == PAGE_LEAF) break;
+
+        int n = leaf.count();
+        const int64_t* keys = leaf.i_keys();
+        const int64_t* chld = leaf.i_children();
+        int i = 0;
+        while (i < n && key > keys[i]) i++;
+        pgno = chld[i];
+    }
+
+    int64_t leaf_pgno = pgno;
     bool found = false;
-    for (int i = 0; i < n; i++) { if (recs[i].key == key) { found = true; break; } }
+    while (leaf_pgno != NULL_PG) {
+        read_page(leaf_pgno, leaf);
+        int n = leaf.count();
+        const Record* recs = leaf.records();
+        for (int i = 0; i < n; i++) {
+            if (recs[i].key == key) { found = true; break; }
+            if (recs[i].key > key) return false;
+        }
+        if (found) break;
+        leaf_pgno = leaf.next();
+    }
     if (!found) return false;
 
     delete_entry(leaf_pgno, key, -1LL);

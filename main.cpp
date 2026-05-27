@@ -44,6 +44,11 @@ static void collect_plt_files(const std::string& dir, std::vector<std::string>& 
     closedir(dp);
 }
 
+static bool directory_exists(const std::string& path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 // ============================================================
 //  工具：将日期/时间字符串转 Unix 时间戳（UTC，秒）
 //  date_str: "YYYY-MM-DD"   time_str: "HH:MM:SS"
@@ -123,17 +128,16 @@ int main(int argc, char* argv[]) {
     SetConsoleOutputCP(65001);  // 设置控制台输出为 UTF-8，解决中文乱码
     SetConsoleCP(65001);
 #endif
-    // 默认数据集路径（可通过命令行参数 argv[1] 覆盖）
-    // Git Bash 路径格式：使用正斜杠
-    const char* default_dir =
-        "C:/Users/\xe9\x9b\xaa\xe9\xa5\xb5/iCloudDrive"
-        "/\xe6\x95\x99\xe8\x82\xb2/\xe5\xae\x9e\xe9\xaa\x8c\xe6\x8a\xa5\xe5\x91\x8a"
-        "/\xe6\xaf\x95\xe4\xb8\x9a\xe8\xae\xbe\xe8\xae\xa1/\xe7\xa8\x8b\xe5\xba\x8f"
-        "/GEOLIFE\xe8\xbd\xa8\xe6\x8a\x80\xe6\x95\xb0\xe6\x8d\xae\xe9\x9b\x86\xe7\xa4\xba\xe4\xbe\x8b";
-    std::string data_dir = default_dir;
+    // 默认数据集路径（可通过命令行参数 argv[1] 覆盖）。
+    // 兼容从项目根目录运行，以及 CLion/CMake 从 cmake-build-debug 运行。
+    std::string data_dir = "GEOLIFE轨技数据集示例";
     std::string idx_file = "geolife.idx";
 
-    if (argc >= 2) data_dir = argv[1];
+    if (argc >= 2) {
+        data_dir = argv[1];
+    } else if (!directory_exists(data_dir) && directory_exists("../GEOLIFE轨技数据集示例")) {
+        data_dir = "../GEOLIFE轨技数据集示例";
+    }
     if (argc >= 3) idx_file = argv[2];
 
     printf("=================================================\n");
@@ -147,7 +151,15 @@ int main(int argc, char* argv[]) {
     std::vector<std::string> plt_files;
     collect_plt_files(data_dir, plt_files);
     std::sort(plt_files.begin(), plt_files.end());
+    printf("    数据目录: %s\n", data_dir.c_str());
     printf("    \u5171\u627e\u5230 %zu \u4e2a .plt \u6587\u4ef6\n", plt_files.size());
+
+    if (plt_files.empty()) {
+        fprintf(stderr,
+                "没有找到 .plt 文件。请检查数据目录，或在 CLion Run Configuration 的 Program arguments 中传入数据集路径。\n"
+                "示例: /Users/xuer/MONA/bptree-experiment/GEOLIFE轨技数据集示例\n");
+        return 1;
+    }
 
     BPTree tree;
     if (!tree.open(idx_file, true)) {
@@ -170,6 +182,11 @@ int main(int argc, char* argv[]) {
     double build_ms = now_ms() - t0;
 
     printf("    \u6784\u5efa\u5b8c\u6210: %d \u6761\u8bb0\u5f55, %.1f ms\n", total_recs, build_ms);
+    if (total_recs == 0 || gmin >= gmax) {
+        fprintf(stderr, "没有解析到有效轨迹记录，无法生成范围查询。\n");
+        tree.close();
+        return 1;
+    }
     printf("    \u65f6\u95f4\u8303\u56f4: [%lld, %lld] (%lld \u79d2)\n",
            (long long)gmin, (long long)gmax, (long long)(gmax - gmin));
     printf("    \u7d22\u5f15\u6587\u4ef6\u9875\u6570: %lld (%.1f MB)\n",
@@ -180,12 +197,6 @@ int main(int argc, char* argv[]) {
     //  (3) 随机生成范围查询
     // --------------------------------------------------------
     printf("\n[3] \u751f\u6210\u8303\u56f4\u67e5\u8be2...\n");
-
-    if (gmin >= gmax) {
-        fprintf(stderr, "\u65f6\u95f4\u8303\u56f4\u65e0\u6548\uff01\n");
-        tree.close();
-        return 1;
-    }
 
     int64_t total_span = gmax - gmin;
     // 4类覆盖比例：1/1000, 1/10000, 1/100000, 1/1000000
@@ -297,6 +308,6 @@ int main(int argc, char* argv[]) {
     }
 
     tree.close();
-    printf("\n\u5b8c\u6210\u3002\u8fd0\u884c 'python visualize.py' \u751f\u6210\u56fe\u8868\u3002\n");
+    printf("\n\u5b8c\u6210\u3002\u8fd0\u884c 'make viz' \u751f\u6210\u56fe\u8868\u3002\n");
     return 0;
 }
