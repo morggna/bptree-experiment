@@ -99,7 +99,7 @@ PageNo BPTree::find_leaf(Key key, int& io_count) {
         const Key* keys = page.i_keys();
         const PageNo* children = page.i_children();
         int i = 0;
-        while (i < key_count && key >= keys[i]) {
+        while (i < key_count && key > keys[i]) {
             i++;
         }
         page_no = children[i];
@@ -419,8 +419,8 @@ bool BPTree::insert(Key key, double lat, double lon, int32_t alt) {
         write_page(leaf_page_no, leaf);
         write_page(new_page_no, new_leaf);
 
-        Key separator_key = new_leaf.records()[0].key;
-        // 新叶页的第一条 key 作为分隔键插入父节点。
+        Key separator_key = leaf.records()[left_record_count - 1].key;
+        // 使用左叶页最后一个 key 作为分隔键，相等时会从左侧开始查，避免漏掉重复时间戳。
         insert_into_parent(leaf_page_no, separator_key, new_page_no);
     }
 
