@@ -3,187 +3,29 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
-#include <cstdio>
-#include <cstring>
-#include <cmath>
-#include <string>
-#include <vector>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <random>
+#include <string>
+#include <vector>
 
 #include <dirent.h>
 #include <sys/stat.h>
 
-// 递归收集 GEOLIFE 数据目录下的 .plt 文件。
+// 先声明辅助函数，让 main() 放在前面展示完整实验流程。
+static bool directory_exists(const std::string& path);
 static void collect_plt_files(const std::string& dir,
-                              std::vector<std::string>& files) {
-    DIR* dp = opendir(dir.c_str());
-    if (!dp) {
-        return;
-    }
-
-    struct dirent* ep;
-    while ((ep = readdir(dp))) {
-        if (strcmp(ep->d_name, ".") == 0 || strcmp(ep->d_name, "..") == 0) {
-            continue;
-        }
-
-        std::string full = dir + "/" + ep->d_name;
-        struct stat st;
-        if (stat(full.c_str(), &st) != 0) {
-            continue;
-        }
-
-        if (S_ISDIR(st.st_mode)) {
-            collect_plt_files(full, files);
-        } else {
-            size_t len = strlen(ep->d_name);
-            if (len > 4 && strcmp(ep->d_name + len - 4, ".plt") == 0) {
-                files.push_back(full);
-            }
-        }
-    }
-
-    closedir(dp);
-}
-
-static bool directory_exists(const std::string& path) {
-    struct stat st;
-    return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
-}
-
-static std::string find_local_geolife_dir() {
-    DIR* dp = opendir(".");
-    if (!dp) {
-        return "";
-    }
-
-    struct dirent* ep;
-    while ((ep = readdir(dp))) {
-        if (strncmp(ep->d_name, "GEOLIFE", 7) != 0) {
-            continue;
-        }
-
-        std::string full = std::string(".") + "/" + ep->d_name;
-        struct stat st;
-        if (stat(full.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
-            continue;
-        }
-
-        std::vector<std::string> files;
-        collect_plt_files(full, files);
-        if (!files.empty()) {
-            closedir(dp);
-            return full;
-        }
-    }
-
-    closedir(dp);
-    return "";
-}
-
-// 去掉 fgets 读入行末尾的换行符，方便后面解析时间字符串。
-static void strip_line_end(char* text) {
-    for (char* p = text; *p; p++) {
-        if (*p == '\r' || *p == '\n') {
-            *p = '\0';
-            return;
-        }
-    }
-}
-
-// 将 .plt 文件中的日期和时间字段转换为 Unix 时间戳。
-static bool datetime_to_unix(const char* date_str, const char* time_str, Timestamp& out_timestamp) {
-    int year = 0;
-    int month = 0;
-    int day = 0;
-    int hour = 0;
-    int min = 0;
-    int sec = 0;
-
-    if (sscanf(date_str, "%d-%d-%d", &year, &month, &day) != 3) {
-        return false;
-    }
-    if (sscanf(time_str, "%d:%d:%d", &hour, &min, &sec) != 3) {
-        return false;
-    }
-
-    if (month <= 2) {
-        month += 12;
-        year--;
-    }
-
-    Timestamp jdn = (Timestamp)365 * year + year / 4 - year / 100 + year / 400
-                    + (153 * month - 457) / 5 + day + 1721119;
-    Timestamp days = jdn - 2440588LL;
-    out_timestamp = days * 86400LL + hour * 3600 + min * 60 + sec;
-    return true;
-}
-
-// 读取一个 .plt 文件，将有效轨迹点直接插入 B+树索引。
+                              std::vector<std::string>& files);
+static std::string find_local_geolife_dir();
 static int parse_plt_and_insert(const std::string& path, BPTree& tree,
-                                 Timestamp& min_ts, Timestamp& max_ts) {
-    FILE* fp = fopen(path.c_str(), "r");
-    if (!fp) {
-        return 0;
-    }
-
-    char line[256];
-
-    // GEOLIFE .plt 文件前 6 行是说明信息，真正的轨迹点从第 7 行开始。
-    for (int i = 0; i < 6; i++) {
-        if (!fgets(line, sizeof(line), fp)) {
-            fclose(fp);
-            return 0;
-        }
-    }
-
-    int inserted = 0;
-    double lat = 0.0;
-    double lon = 0.0;
-    double dummy = 0.0;
-    double alt_value = 0.0;
-    double days_value = 0.0;
-    int alt = 0;
-    char date_str[32];
-    char time_str[32];
-
-    while (fgets(line, sizeof(line), fp)) {
-        // GEOLIFE 每行格式为：纬度、经度、0、海拔、日期数值、日期、时间。
-        if (sscanf(line, "%lf,%lf,%lf,%lf,%lf,%31[^,],%31s",
-                   &lat, &lon, &dummy, &alt_value, &days_value,
-                   date_str, time_str) != 7) {
-            continue;
-        }
-        alt = (int)std::lround(alt_value);
-        strip_line_end(time_str);
-
-        Timestamp timestamp = 0;
-        if (!datetime_to_unix(date_str, time_str, timestamp) || timestamp <= 0) {
-            // 少量格式异常的行直接跳过，不影响整个数据集导入。
-            continue;
-        }
-
-        tree.insert(timestamp, lat, lon, alt);
-        inserted++;
-        // 导入时顺便记录全局时间范围，后面用它生成随机查询窗口。
-        if (timestamp < min_ts) {
-            min_ts = timestamp;
-        }
-        if (timestamp > max_ts) {
-            max_ts = timestamp;
-        }
-    }
-    fclose(fp);
-    return inserted;
-}
-
-static double now_ms() {
-    using namespace std::chrono;
-    return duration<double, std::milli>(
-        high_resolution_clock::now().time_since_epoch()).count();
-}
+                                Timestamp& min_ts, Timestamp& max_ts);
+static bool datetime_to_unix(const char* date_str, const char* time_str,
+                             Timestamp& out_timestamp);
+static void strip_line_end(char* text);
+static double now_ms();
 
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
@@ -203,11 +45,12 @@ int main(int argc, char* argv[]) {
         index_path = argv[2];
     }
 
+    // 主程序按实验流程组织：收集数据、构建索引、执行查询、输出结果。
     printf("=================================================\n");
-    printf("  B+\u6811\u7d22\u5f15\u6027\u80fd\u6d4b\u8bd5  (IO\u5757\u5927\u5c0f = %d KB)\n", PAGE_SIZE / 1024);
+    printf("  B+树索引性能测试  (IO块大小 = %d KB)\n", PAGE_SIZE / 1024);
     printf("=================================================\n\n");
 
-    printf("[1] \u6536\u96c6 .plt \u6587\u4ef6...\n");
+    printf("[1] 收集 .plt 文件...\n");
     std::vector<std::string> plt_files;
     collect_plt_files(data_dir, plt_files);
     if (plt_files.empty() && argc < 2) {
@@ -220,7 +63,7 @@ int main(int argc, char* argv[]) {
     // 排序后每次实验的导入顺序一致，结果更容易复现。
     std::sort(plt_files.begin(), plt_files.end());
     printf("    数据目录: %s\n", data_dir.c_str());
-    printf("    \u5171\u627e\u5230 %zu \u4e2a .plt \u6587\u4ef6\n", plt_files.size());
+    printf("    共找到 %zu 个 .plt 文件\n", plt_files.size());
     if (plt_files.empty()) {
         fprintf(stderr,
                 "没有找到 .plt 文件。请检查数据目录，或在 CLion Run Configuration 的 Program arguments 中传入数据集路径。\n"
@@ -229,8 +72,9 @@ int main(int argc, char* argv[]) {
     }
 
     BPTree tree;
+    // create=true 表示重新创建一个自定义二进制索引文件。
     if (!tree.open(index_path, true)) {
-        fprintf(stderr, "\u65e0\u6cd5\u521b\u5efa\u7d22\u5f15\u6587\u4ef6: %s\n", index_path.c_str());
+        fprintf(stderr, "无法创建索引文件: %s\n", index_path.c_str());
         return 1;
     }
 
@@ -239,34 +83,36 @@ int main(int argc, char* argv[]) {
     int total_recs = 0;
     double build_start_ms = now_ms();
 
-    printf("[2] \u89e3\u6790\u5e76\u63d2\u5165\u8bb0\u5f55...\n");
+    printf("[2] 解析并插入记录...\n");
     for (size_t i = 0; i < plt_files.size(); i++) {
+        // 每个 .plt 文件解析出的轨迹点会立即插入 B+树索引。
         int inserted = parse_plt_and_insert(plt_files[i], tree, min_ts, max_ts);
         total_recs += inserted;
         if ((i + 1) % 50 == 0 || i + 1 == plt_files.size()) {
-            printf("    \u5df2\u5904\u7406 %zu/%zu \u6587\u4ef6, \u5171 %d \u6761\u8bb0\u5f55\r",
+            printf("    已处理 %zu/%zu 文件, 共 %d 条记录\r",
                    i + 1, plt_files.size(), total_recs);
         }
     }
     printf("\n");
     double build_ms = now_ms() - build_start_ms;
 
-    printf("    \u6784\u5efa\u5b8c\u6210: %d \u6761\u8bb0\u5f55, %.1f ms\n", total_recs, build_ms);
+    printf("    构建完成: %d 条记录, %.1f ms\n", total_recs, build_ms);
     if (total_recs == 0 || min_ts >= max_ts) {
         fprintf(stderr, "没有解析到有效轨迹记录，无法生成范围查询。\n");
         tree.close();
         return 1;
     }
-    printf("    \u65f6\u95f4\u8303\u56f4: [%lld, %lld] (%lld \u79d2)\n",
+    printf("    时间范围: [%lld, %lld] (%lld 秒)\n",
            (long long)min_ts,
            (long long)max_ts,
            (long long)(max_ts - min_ts));
-    printf("    \u7d22\u5f15\u6587\u4ef6\u9875\u6570: %lld (%.1f MB)\n",
+    printf("    索引文件页数: %lld (%.1f MB)\n",
            (long long)tree.total_pages(),
            tree.total_pages() * PAGE_SIZE / 1024.0 / 1024.0);
 
-    printf("\n[3] \u751f\u6210\u8303\u56f4\u67e5\u8be2...\n");
+    printf("\n[3] 生成范围查询...\n");
 
+    // 随机查询窗口基于真实数据的时间范围生成，避免查到完全无关的时间段。
     Timestamp span = max_ts - min_ts;
 
     const Timestamp divisors[4] = { 1000LL, 10000LL, 100000LL, 1000000LL };
@@ -307,6 +153,7 @@ int main(int argc, char* argv[]) {
             std::vector<Record> hits;
             int io_count = 0;
             double query_start_ms = now_ms();
+            // range_query 是实验核心：返回命中记录，同时统计访问了多少个逻辑页。
             tree.range_query(q_min, q_max, hits, io_count);
             double elapsed_ms = now_ms() - query_start_ms;
 
@@ -320,19 +167,20 @@ int main(int argc, char* argv[]) {
             r.io_count = io_count;
             results.push_back(r);
         }
-        printf("    \u7c7b\u522b %s: %d \u4e2a\u67e5\u8be2\u5b8c\u6210\n",
+        printf("    类别 %s: %d 个查询完成\n",
                labels[cat], QUERIES_PER_CAT);
     }
 
-    printf("\n[4] \u67e5\u8be2\u6027\u80fd\u7ed3\u679c\n");
+    printf("\n[4] 查询性能结果\n");
     printf("%-12s %10s %10s %10s %10s\n",
-           "\u7c7b\u522b", "\u5e73\u5747\u65f6\u95f4(ms)", "\u6700\u5927(ms)", "\u5e73\u5747IO\u6b21", "\u5e73\u5747\u547d\u4e2d\u6570");
+           "类别", "平均时间(ms)", "最大(ms)", "平均IO次", "平均命中数");
     printf("%-12s %10s %10s %10s %10s\n",
            "----------", "----------", "----------", "----------", "----------");
 
     double avg_time[4]={}, max_time[4]={}, avg_io[4]={}, avg_hits[4]={};
     int counts[4] = {};
 
+    // 先累加每类查询的结果，再除以查询次数得到平均值。
     for (const QueryResult& r : results) {
         int cat = r.cat;
         counts[cat]++;
@@ -377,7 +225,7 @@ int main(int argc, char* argv[]) {
                     r.hits, r.time_ms, r.io_count);
         }
         fclose(csv);
-        printf("\n\u67e5\u8be2\u7ed3\u679c\u5df2\u5199\u5165: query_results.csv\n");
+        printf("\n查询结果已写入: query_results.csv\n");
     }
 
     {
@@ -399,10 +247,183 @@ int main(int argc, char* argv[]) {
                     avg_hits[cat]);
         }
         fclose(csv);
-        printf("\u6c47\u603b\u7ed3\u679c\u5df2\u5199\u5165: query_summary.csv\n");
+        printf("汇总结果已写入: query_summary.csv\n");
     }
 
     tree.close();
-    printf("\n\u5b8c\u6210\u3002\u8fd0\u884c 'make viz' \u751f\u6210\u56fe\u8868\u3002\n");
+    printf("\n完成。运行 'make viz' 生成图表。\n");
     return 0;
+}
+
+static bool directory_exists(const std::string& path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+// 递归收集 GEOLIFE 数据目录下的 .plt 文件。
+static void collect_plt_files(const std::string& dir,
+                              std::vector<std::string>& files) {
+    DIR* dp = opendir(dir.c_str());
+    if (!dp) {
+        return;
+    }
+
+    struct dirent* ep;
+    while ((ep = readdir(dp))) {
+        if (strcmp(ep->d_name, ".") == 0 || strcmp(ep->d_name, "..") == 0) {
+            continue;
+        }
+
+        std::string full = dir + "/" + ep->d_name;
+        struct stat st;
+        if (stat(full.c_str(), &st) != 0) {
+            continue;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            collect_plt_files(full, files);
+        } else {
+            size_t len = strlen(ep->d_name);
+            if (len > 4 && strcmp(ep->d_name + len - 4, ".plt") == 0) {
+                files.push_back(full);
+            }
+        }
+    }
+
+    closedir(dp);
+}
+
+static std::string find_local_geolife_dir() {
+    // 没有显式传入数据目录时，尝试在当前目录寻找 GEOLIFE 示例数据集。
+    DIR* dp = opendir(".");
+    if (!dp) {
+        return "";
+    }
+
+    struct dirent* ep;
+    while ((ep = readdir(dp))) {
+        if (strncmp(ep->d_name, "GEOLIFE", 7) != 0) {
+            continue;
+        }
+
+        std::string full = std::string(".") + "/" + ep->d_name;
+        struct stat st;
+        if (stat(full.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+            continue;
+        }
+
+        std::vector<std::string> files;
+        collect_plt_files(full, files);
+        if (!files.empty()) {
+            closedir(dp);
+            return full;
+        }
+    }
+
+    closedir(dp);
+    return "";
+}
+
+// 读取一个 .plt 文件，将有效轨迹点直接插入 B+树索引。
+static int parse_plt_and_insert(const std::string& path, BPTree& tree,
+                                Timestamp& min_ts, Timestamp& max_ts) {
+    FILE* fp = fopen(path.c_str(), "r");
+    if (!fp) {
+        return 0;
+    }
+
+    char line[256];
+
+    // GEOLIFE .plt 文件前 6 行是说明信息，真正的轨迹点从第 7 行开始。
+    for (int i = 0; i < 6; i++) {
+        if (!fgets(line, sizeof(line), fp)) {
+            fclose(fp);
+            return 0;
+        }
+    }
+
+    int inserted = 0;
+    double lat = 0.0;
+    double lon = 0.0;
+    double dummy = 0.0;
+    double alt_value = 0.0;
+    double days_value = 0.0;
+    int alt = 0;
+    char date_str[32];
+    char time_str[32];
+
+    while (fgets(line, sizeof(line), fp)) {
+        // GEOLIFE 每行格式为：纬度、经度、0、海拔、日期数值、日期、时间。
+        if (sscanf(line, "%lf,%lf,%lf,%lf,%lf,%31[^,],%31s",
+                   &lat, &lon, &dummy, &alt_value, &days_value,
+                   date_str, time_str) != 7) {
+            continue;
+        }
+        alt = (int)std::lround(alt_value);
+        strip_line_end(time_str);
+
+        Timestamp timestamp = 0;
+        if (!datetime_to_unix(date_str, time_str, timestamp) || timestamp <= 0) {
+            // 少量格式异常的行直接跳过，不影响整个数据集导入。
+            continue;
+        }
+
+        // 时间戳是 B+树的索引键，位置和海拔作为叶页中的记录内容保存。
+        tree.insert(timestamp, lat, lon, alt);
+        inserted++;
+        // 导入时顺便记录全局时间范围，后面用它生成随机查询窗口。
+        if (timestamp < min_ts) {
+            min_ts = timestamp;
+        }
+        if (timestamp > max_ts) {
+            max_ts = timestamp;
+        }
+    }
+    fclose(fp);
+    return inserted;
+}
+
+// 将 .plt 文件中的日期和时间字段转换为 Unix 时间戳。
+static bool datetime_to_unix(const char* date_str, const char* time_str,
+                             Timestamp& out_timestamp) {
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int min = 0;
+    int sec = 0;
+
+    if (sscanf(date_str, "%d-%d-%d", &year, &month, &day) != 3) {
+        return false;
+    }
+    if (sscanf(time_str, "%d:%d:%d", &hour, &min, &sec) != 3) {
+        return false;
+    }
+
+    if (month <= 2) {
+        month += 12;
+        year--;
+    }
+
+    Timestamp jdn = (Timestamp)365 * year + year / 4 - year / 100 + year / 400
+                    + (153 * month - 457) / 5 + day + 1721119;
+    Timestamp days = jdn - 2440588LL;
+    out_timestamp = days * 86400LL + hour * 3600 + min * 60 + sec;
+    return true;
+}
+
+// 去掉 fgets 读入行末尾的换行符，方便后面解析时间字符串。
+static void strip_line_end(char* text) {
+    for (char* p = text; *p; p++) {
+        if (*p == '\r' || *p == '\n') {
+            *p = '\0';
+            return;
+        }
+    }
+}
+
+static double now_ms() {
+    using namespace std::chrono;
+    return duration<double, std::milli>(
+        high_resolution_clock::now().time_since_epoch()).count();
 }

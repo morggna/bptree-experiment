@@ -2,6 +2,7 @@
 #include <cstring>
 #include <cstdio>
 
+// 索引文件和页面管理。
 BPTree::BPTree() : fp_(nullptr), meta_dirty_(false) {
     memset(&meta_, 0, sizeof(meta_));
 }
@@ -17,6 +18,7 @@ bool BPTree::open(const std::string& path, bool create) {
 
     if (create) {
         // 新建索引文件时，先写入页 0 作为元数据页。
+        // 后续所有内部页和叶页都从页 1 开始分配。
         fp_ = fopen(path.c_str(), "w+b");
         if (!fp_) {
             return false;
@@ -88,7 +90,7 @@ PageNo BPTree::find_leaf(Key key, int& io_count) {
 
     PageBuf page;
     while (true) {
-        // 从根页逐层向下，直到找到应插入的叶页。
+        // 从根页逐层向下，直到找到可能包含目标 key 的叶页。
         read_page(page_no, page);
         io_count++;
         if (page.type() == PAGE_LEAF) {
@@ -99,6 +101,8 @@ PageNo BPTree::find_leaf(Key key, int& io_count) {
         const Key* keys = page.i_keys();
         const PageNo* children = page.i_children();
         int i = 0;
+        // 本实现中 keys[i] 表示 children[i] 的最大 key。
+        // 因此只有 key 更大时才跳过该孩子；相等时留在左侧，便于处理重复时间戳。
         while (i < key_count && key > keys[i]) {
             i++;
         }
@@ -106,6 +110,223 @@ PageNo BPTree::find_leaf(Key key, int& io_count) {
     }
 }
 
+// 插入维护：叶页有序插入、分裂后接回父节点。
+void BPTree::insert_record_in_leaf(PageBuf& leaf, const Record& rec) {
+    // 叶页内部保持按 key 升序，插入时先移动较大的记录。
+    int record_count = leaf.count();
+    Record* records = leaf.records();
+    int i = record_count;
+    while (i > 0 && records[i - 1].key > rec.key) {
+        records[i] = records[i - 1];
+        i--;
+    }
+    records[i] = rec;
+    leaf.count()++;
+}
+
+void BPTree::insert_into_parent(PageNo left_page_no, Key separator_key, PageNo right_page_no) {
+    // 一个页分裂成 left/right 后，父节点需要新增一个分隔键和右页页号。
+    PageBuf left, right;
+    read_page(left_page_no,  left);
+    read_page(right_page_no, right);
+    PageNo parent_page_no = left.parent();
+
+    right.parent() = parent_page_no;
+    write_page(right_page_no, right);
+
+    if (parent_page_no == NULL_PAGE) {
+        // 左右页原来没有父节点，说明分裂发生在根节点，需要创建新根。
+        PageNo new_root_page_no = alloc_page();
+        PageBuf root_page;
+        memset(&root_page, 0, sizeof(root_page));
+        root_page.type()          = PAGE_INTERNAL;
+        root_page.count()         = 1;
+        root_page.parent()        = NULL_PAGE;
+        root_page.i_keys()[0]     = separator_key;
+        root_page.i_children()[0] = left_page_no;
+        root_page.i_children()[1] = right_page_no;
+        write_page(new_root_page_no, root_page);
+
+        left.parent()  = new_root_page_no;
+        right.parent() = new_root_page_no;
+        write_page(left_page_no,  left);
+        write_page(right_page_no, right);
+
+        meta_.root_pg() = new_root_page_no;
+        meta_dirty_ = true;
+        return;
+    }
+
+    PageBuf parent;
+    read_page(parent_page_no, parent);
+    int key_count = parent.count();
+    Key* keys = parent.i_keys();
+    PageNo* children = parent.i_children();
+
+    int child_index = 0;
+    while (child_index <= key_count && children[child_index] != left_page_no) {
+        child_index++;
+    }
+
+    if (key_count < INTERNAL_MAX_KEYS) {
+        // 父节点还有空位，直接插入分隔键和新的右子页号。
+        // keys 和 children 是连续数组，先整体右移，为新内容腾出位置。
+        for (int i = key_count; i > child_index; i--) {
+            keys[i] = keys[i - 1];
+        }
+        for (int i = key_count + 1; i > child_index + 1; i--) {
+            children[i] = children[i - 1];
+        }
+        keys[child_index] = separator_key;
+        children[child_index + 1] = right_page_no;
+        parent.count()++;
+        write_page(parent_page_no, parent);
+
+        right.parent() = parent_page_no;
+        write_page(right_page_no, right);
+    } else {
+        // 父节点已满时继续分裂内部页，并把中间键上推。
+        // 临时数组先容纳“原父节点内容 + 新分隔键 + 新右孩子”。
+        Key tmp_keys[INTERNAL_MAX_KEYS + 1];
+        PageNo tmp_children[INTERNAL_MAX_KEYS + 2];
+        memcpy(tmp_keys, keys, key_count * sizeof(Key));
+        memcpy(tmp_children, children, (key_count + 1) * sizeof(PageNo));
+
+        for (int i = key_count; i > child_index; i--) {
+            tmp_keys[i] = tmp_keys[i - 1];
+        }
+        for (int i = key_count + 1; i > child_index + 1; i--) {
+            tmp_children[i] = tmp_children[i - 1];
+        }
+        tmp_keys[child_index] = separator_key;
+        tmp_children[child_index + 1] = right_page_no;
+
+        int total_keys = key_count + 1;
+        int left_key_count = (total_keys - 1) / 2;
+        // 内部页分裂时，中间 key 不留在左右页中，而是作为上层分隔键。
+        Key promoted_key = tmp_keys[left_key_count];
+        int right_key_count = total_keys - left_key_count - 1;
+
+        parent.count() = left_key_count;
+        memcpy(parent.i_keys(), tmp_keys, left_key_count * sizeof(Key));
+        memcpy(parent.i_children(), tmp_children, (left_key_count + 1) * sizeof(PageNo));
+        write_page(parent_page_no, parent);
+
+        PageNo new_internal_page_no = alloc_page();
+        PageBuf new_internal;
+        memset(&new_internal, 0, sizeof(new_internal));
+        new_internal.type()   = PAGE_INTERNAL;
+        new_internal.count()  = right_key_count;
+        new_internal.parent() = parent.parent();
+        memcpy(new_internal.i_keys(), tmp_keys + left_key_count + 1, right_key_count * sizeof(Key));
+        memcpy(new_internal.i_children(),
+               tmp_children + left_key_count + 1,
+               (right_key_count + 1) * sizeof(PageNo));
+        write_page(new_internal_page_no, new_internal);
+
+        for (int i = 0; i <= right_key_count; i++) {
+            // 被分到新内部页的孩子，需要把 parent 改成新内部页页号。
+            PageBuf child;
+            read_page(new_internal.i_children()[i], child);
+            child.parent() = new_internal_page_no;
+            write_page(new_internal.i_children()[i], child);
+        }
+
+        insert_into_parent(parent_page_no, promoted_key, new_internal_page_no);
+    }
+}
+
+// 构建索引：插入记录，必要时分裂叶页并向上调整。
+bool BPTree::insert(Key key, double lat, double lon, int32_t alt) {
+    Record rec;
+    rec.key  = key;
+    rec.lat  = lat;
+    rec.lon  = lon;
+    rec.alt  = alt;
+    rec._pad = 0;
+
+    if (meta_.root_pg() == NULL_PAGE) {
+        // 空树第一次插入时，直接创建一个叶页作为根页。
+        PageNo page_no = alloc_page();
+        PageBuf leaf;
+        memset(&leaf, 0, sizeof(leaf));
+        leaf.type()   = PAGE_LEAF;
+        leaf.count()  = 0;
+        leaf.parent() = NULL_PAGE;
+        leaf.next()   = NULL_PAGE;
+        insert_record_in_leaf(leaf, rec);
+        write_page(page_no, leaf);
+        meta_.root_pg() = page_no;
+        meta_.rec_count()++;
+        meta_dirty_ = true;
+        flush_meta();
+        return true;
+    }
+
+    int io_dummy;
+    PageNo leaf_page_no = find_leaf(key, io_dummy);
+    PageBuf leaf;
+    read_page(leaf_page_no, leaf);
+
+    if (leaf.count() < LEAF_MAX_KEYS) {
+        // 目标叶页未满，直接在页内有序插入。
+        insert_record_in_leaf(leaf, rec);
+        write_page(leaf_page_no, leaf);
+    } else {
+        // 目标叶页已满，先合并为临时数组，再平均拆成左右两个叶页。
+        // 这样可以保证分裂后的两个叶页内部仍然按时间戳有序。
+        Record tmp[LEAF_MAX_KEYS + 1];
+        int record_count = leaf.count();
+        const Record* records = leaf.records();
+        int insert_pos = record_count;
+        for (int i = 0; i < record_count; i++) {
+            if (records[i].key > key) {
+                insert_pos = i;
+                break;
+            }
+        }
+        for (int i = 0; i < insert_pos; i++) {
+            tmp[i] = records[i];
+        }
+        tmp[insert_pos] = rec;
+        for (int i = insert_pos; i < record_count; i++) {
+            tmp[i + 1] = records[i];
+        }
+
+        int total_records = record_count + 1;
+        int left_record_count = (total_records + 1) / 2;
+        int right_record_count = total_records - left_record_count;
+
+        // 新叶页放右半部分记录，并接到原叶页的 next 链表中。
+        PageNo new_page_no = alloc_page();
+        PageBuf new_leaf;
+        memset(&new_leaf, 0, sizeof(new_leaf));
+        new_leaf.type()   = PAGE_LEAF;
+        new_leaf.count()  = right_record_count;
+        new_leaf.parent() = leaf.parent();
+        new_leaf.next()   = leaf.next();
+
+        leaf.count() = left_record_count;
+        leaf.next()  = new_page_no;
+
+        memcpy(leaf.records(), tmp, left_record_count * sizeof(Record));
+        memcpy(new_leaf.records(), tmp + left_record_count, right_record_count * sizeof(Record));
+
+        write_page(leaf_page_no, leaf);
+        write_page(new_page_no, new_leaf);
+
+        // 父节点记录左叶页的最大 key；相等查询会先走左页，再沿叶链向右扫。
+        Key separator_key = leaf.records()[left_record_count - 1].key;
+        insert_into_parent(leaf_page_no, separator_key, new_page_no);
+    }
+
+    meta_.rec_count()++;
+    meta_dirty_ = true;
+    flush_meta();
+    return true;
+}
+
+// 查询索引：先定位叶页，再扫描叶页或叶链。
 bool BPTree::search(Key key, Record& out, int* io_count) {
     int io = 0;
     PageNo page_no = meta_.root_pg();
@@ -129,6 +350,7 @@ bool BPTree::search(Key key, Record& out, int* io_count) {
         const Key* keys = leaf.i_keys();
         const PageNo* children = leaf.i_children();
         int i = 0;
+        // 和 find_leaf 保持同一套规则：相等时先走左侧。
         while (i < key_count && key > keys[i]) {
             i++;
         }
@@ -169,6 +391,7 @@ bool BPTree::search(Key key, Record& out, int* io_count) {
 
 int BPTree::range_query(Key key_min, Key key_max,
                         std::vector<Record>& results, int& io_count) {
+    // 范围查询分两步：先定位起始叶页，再沿叶页链表顺序扫描。
     results.clear();
     io_count = 0;
     if (meta_.root_pg() == NULL_PAGE) {
@@ -221,211 +444,4 @@ int BPTree::range_query(Key key_min, Key key_max,
         io_count++;
     }
     return (int)results.size();
-}
-
-void BPTree::insert_record_in_leaf(PageBuf& leaf, const Record& rec) {
-    // 叶页内部保持按 key 升序，插入时先移动较大的记录。
-    int record_count = leaf.count();
-    Record* records = leaf.records();
-    int i = record_count;
-    while (i > 0 && records[i - 1].key > rec.key) {
-        records[i] = records[i - 1];
-        i--;
-    }
-    records[i] = rec;
-    leaf.count()++;
-}
-
-void BPTree::insert_into_parent(PageNo left_page_no, Key separator_key, PageNo right_page_no) {
-    PageBuf left, right;
-    read_page(left_page_no,  left);
-    read_page(right_page_no, right);
-    PageNo parent_page_no = left.parent();
-
-    right.parent() = parent_page_no;
-    write_page(right_page_no, right);
-
-    if (parent_page_no == NULL_PAGE) {
-        // 左右页原来没有父节点，说明分裂发生在根节点，需要创建新根。
-        PageNo new_root_page_no = alloc_page();
-        PageBuf root_page;
-        memset(&root_page, 0, sizeof(root_page));
-        root_page.type()          = PAGE_INTERNAL;
-        root_page.count()         = 1;
-        root_page.parent()        = NULL_PAGE;
-        root_page.i_keys()[0]     = separator_key;
-        root_page.i_children()[0] = left_page_no;
-        root_page.i_children()[1] = right_page_no;
-        write_page(new_root_page_no, root_page);
-
-        left.parent()  = new_root_page_no;
-        right.parent() = new_root_page_no;
-        write_page(left_page_no,  left);
-        write_page(right_page_no, right);
-
-        meta_.root_pg() = new_root_page_no;
-        meta_dirty_ = true;
-        return;
-    }
-
-    PageBuf parent;
-    read_page(parent_page_no, parent);
-    int key_count = parent.count();
-    Key* keys = parent.i_keys();
-    PageNo* children = parent.i_children();
-
-    int child_index = 0;
-    while (child_index <= key_count && children[child_index] != left_page_no) {
-        child_index++;
-    }
-
-    if (key_count < INTERNAL_MAX_KEYS) {
-        // 父节点还有空位，直接插入分隔键和新的右子页号。
-        for (int i = key_count; i > child_index; i--) {
-            keys[i] = keys[i - 1];
-        }
-        for (int i = key_count + 1; i > child_index + 1; i--) {
-            children[i] = children[i - 1];
-        }
-        keys[child_index] = separator_key;
-        children[child_index + 1] = right_page_no;
-        parent.count()++;
-        write_page(parent_page_no, parent);
-
-        right.parent() = parent_page_no;
-        write_page(right_page_no, right);
-    } else {
-        // 父节点已满时继续分裂内部页，并把中间键上推。
-        Key tmp_keys[INTERNAL_MAX_KEYS + 1];
-        PageNo tmp_children[INTERNAL_MAX_KEYS + 2];
-        memcpy(tmp_keys, keys, key_count * sizeof(Key));
-        memcpy(tmp_children, children, (key_count + 1) * sizeof(PageNo));
-
-        for (int i = key_count; i > child_index; i--) {
-            tmp_keys[i] = tmp_keys[i - 1];
-        }
-        for (int i = key_count + 1; i > child_index + 1; i--) {
-            tmp_children[i] = tmp_children[i - 1];
-        }
-        tmp_keys[child_index] = separator_key;
-        tmp_children[child_index + 1] = right_page_no;
-
-        int total_keys = key_count + 1;
-        int left_key_count = (total_keys - 1) / 2;
-        Key promoted_key = tmp_keys[left_key_count];
-        int right_key_count = total_keys - left_key_count - 1;
-
-        parent.count() = left_key_count;
-        memcpy(parent.i_keys(), tmp_keys, left_key_count * sizeof(Key));
-        memcpy(parent.i_children(), tmp_children, (left_key_count + 1) * sizeof(PageNo));
-        write_page(parent_page_no, parent);
-
-        PageNo new_internal_page_no = alloc_page();
-        PageBuf new_internal;
-        memset(&new_internal, 0, sizeof(new_internal));
-        new_internal.type()   = PAGE_INTERNAL;
-        new_internal.count()  = right_key_count;
-        new_internal.parent() = parent.parent();
-        memcpy(new_internal.i_keys(), tmp_keys + left_key_count + 1, right_key_count * sizeof(Key));
-        memcpy(new_internal.i_children(),
-               tmp_children + left_key_count + 1,
-               (right_key_count + 1) * sizeof(PageNo));
-        write_page(new_internal_page_no, new_internal);
-
-        for (int i = 0; i <= right_key_count; i++) {
-            PageBuf child;
-            read_page(new_internal.i_children()[i], child);
-            child.parent() = new_internal_page_no;
-            write_page(new_internal.i_children()[i], child);
-        }
-
-        insert_into_parent(parent_page_no, promoted_key, new_internal_page_no);
-    }
-}
-
-bool BPTree::insert(Key key, double lat, double lon, int32_t alt) {
-    Record rec;
-    rec.key  = key;
-    rec.lat  = lat;
-    rec.lon  = lon;
-    rec.alt  = alt;
-    rec._pad = 0;
-
-    if (meta_.root_pg() == NULL_PAGE) {
-        // 空树第一次插入时，直接创建一个叶页作为根页。
-        PageNo page_no = alloc_page();
-        PageBuf leaf;
-        memset(&leaf, 0, sizeof(leaf));
-        leaf.type()   = PAGE_LEAF;
-        leaf.count()  = 0;
-        leaf.parent() = NULL_PAGE;
-        leaf.next()   = NULL_PAGE;
-        insert_record_in_leaf(leaf, rec);
-        write_page(page_no, leaf);
-        meta_.root_pg() = page_no;
-        meta_.rec_count()++;
-        meta_dirty_ = true;
-        flush_meta();
-        return true;
-    }
-
-    int io_dummy;
-    PageNo leaf_page_no = find_leaf(key, io_dummy);
-    PageBuf leaf;
-    read_page(leaf_page_no, leaf);
-
-    if (leaf.count() < LEAF_MAX_KEYS) {
-        // 目标叶页未满，直接在页内有序插入。
-        insert_record_in_leaf(leaf, rec);
-        write_page(leaf_page_no, leaf);
-    } else {
-        // 目标叶页已满，先合并为临时数组，再平均拆成左右两个叶页。
-        Record tmp[LEAF_MAX_KEYS + 1];
-        int record_count = leaf.count();
-        const Record* records = leaf.records();
-        int insert_pos = record_count;
-        for (int i = 0; i < record_count; i++) {
-            if (records[i].key > key) {
-                insert_pos = i;
-                break;
-            }
-        }
-        for (int i = 0; i < insert_pos; i++) {
-            tmp[i] = records[i];
-        }
-        tmp[insert_pos] = rec;
-        for (int i = insert_pos; i < record_count; i++) {
-            tmp[i + 1] = records[i];
-        }
-
-        int total_records = record_count + 1;
-        int left_record_count = (total_records + 1) / 2;
-        int right_record_count = total_records - left_record_count;
-
-        PageNo new_page_no = alloc_page();
-        PageBuf new_leaf;
-        memset(&new_leaf, 0, sizeof(new_leaf));
-        new_leaf.type()   = PAGE_LEAF;
-        new_leaf.count()  = right_record_count;
-        new_leaf.parent() = leaf.parent();
-        new_leaf.next()   = leaf.next();
-
-        leaf.count() = left_record_count;
-        leaf.next()  = new_page_no;
-
-        memcpy(leaf.records(), tmp, left_record_count * sizeof(Record));
-        memcpy(new_leaf.records(), tmp + left_record_count, right_record_count * sizeof(Record));
-
-        write_page(leaf_page_no, leaf);
-        write_page(new_page_no, new_leaf);
-
-        Key separator_key = leaf.records()[left_record_count - 1].key;
-        // 使用左叶页最后一个 key 作为分隔键，相等时会从左侧开始查，避免漏掉重复时间戳。
-        insert_into_parent(leaf_page_no, separator_key, new_page_no);
-    }
-
-    meta_.rec_count()++;
-    meta_dirty_ = true;
-    flush_meta();
-    return true;
 }

@@ -5,9 +5,9 @@
 #include <vector>
 #include <cstring>
 
-using PageNo = int64_t;
-using Key = int64_t;
-using Timestamp = int64_t;
+using PageNo = int64_t;     // 文件页号，用来代替内存指针。
+using Key = int64_t;        // B+树索引键，本实验中就是 Unix 时间戳。
+using Timestamp = int64_t;  // 主程序解析轨迹时间时使用的整数时间。
 
 // 每个索引页固定为 8 KB，页内容量按这个大小计算。
 static const int    PAGE_SIZE         = 8192;
@@ -28,6 +28,7 @@ struct Record {
 static_assert(sizeof(Record) == 32, "Record must be 32 bytes");
 
 // PageBuf 表示文件中的一个 8 KB 页面，所有字段都按固定偏移解释。
+// 这样写入文件后，下次打开仍能按同样的布局读回 B+树节点。
 struct PageBuf {
 
     alignas(8) char data[PAGE_SIZE];
@@ -40,13 +41,13 @@ struct PageBuf {
     PageNo  parent() const { return *(const PageNo*)(data +  8); }
     PageNo& parent()       { return *(      PageNo*)(data +  8); }
 
-    // 内部页：保存子页号数组和分隔键数组。
+    // 内部页：保存子页号数组和分隔键数组，子页号就是磁盘版的 child 指针。
     PageNo*       i_children()       { return (      PageNo*)(data + 16);   }
     const PageNo* i_children() const { return (const PageNo*)(data + 16);   }
     Key*          i_keys()           { return (      Key*)(data + 4104); }
     const Key*    i_keys()     const { return (const Key*)(data + 4104); }
 
-    // 叶页：保存后继叶页页号和轨迹记录数组。
+    // 叶页：保存后继叶页页号和轨迹记录数组，next 用于范围查询顺序扫描。
     PageNo  next()   const { return *(const PageNo*)(data + 16); }
     PageNo& next()         { return *(      PageNo*)(data + 16); }
     Record*       records()       { return (      Record*)(data + 24); }
